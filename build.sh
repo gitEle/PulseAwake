@@ -45,6 +45,7 @@ if [ "$MODE" = "--dist" ]; then
   mkdir -p "$STAGE_DIR" "$DIST_DIR"
   ditto "$BUILD_APP" "$STAGE_DIR/$APP_NAME.app"
   [ -f README.md ] && cp README.md "$STAGE_DIR/README.md"
+  [ -f README_EN.md ] && cp README_EN.md "$STAGE_DIR/README_EN.md"
   [ -f LICENSE ] && cp LICENSE "$STAGE_DIR/LICENSE"
 
   echo "4/4 打包压缩并生成 SHA256SUMS.txt..."
