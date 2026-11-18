@@ -169,11 +169,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func isClamshellSleepDisabled() -> Bool {
-        let root = IOPMFindPowerManagement(mach_port_t(MACH_PORT_NULL))
-        guard root != 0 else { return false }
-        defer { IOObjectRelease(root) }
+        let entry = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard entry != 0 else { return false }
+        defer { IOObjectRelease(entry) }
         guard let raw = IORegistryEntryCreateCFProperty(
-            root,
+            entry,
             "SleepDisabled" as CFString,
             kCFAllocatorDefault,
             0
