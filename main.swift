@@ -287,9 +287,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if jiggleOn && !trusted {
             symbolName = "exclamationmark.triangle"
         } else if jiggleOn || anySleepGuard {
-            symbolName = "bolt.horizontal.circle.fill"
+            symbolName = "waveform.path.ecg.rectangle.fill"
         } else {
-            symbolName = "bolt.horizontal.circle"
+            symbolName = "waveform.path.ecg.rectangle"
         }
 
         if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "PulseAwake") {
