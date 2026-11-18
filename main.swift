@@ -1,4 +1,5 @@
 import Cocoa
+import IOKit
 import IOKit.pwr_mgt
 import CoreGraphics
 import ApplicationServices
@@ -17,6 +18,7 @@ private enum MenuTag: Int {
     case sleep       = 103
     case display     = 104
     case launchLogin = 105
+    case clamshell   = 106
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -131,7 +133,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // MARK: - 电源防休眠断言（独立状态同步）
+    // MARK: - 电源防休眠断言与合盖模式
 
     private func syncSleepAssertions() {
         let wantIdle = defaults.bool(forKey: kPreventSleep)
@@ -164,6 +166,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func releaseAllAssertions() {
         if idleSleepID != 0 { IOPMAssertionRelease(idleSleepID); idleSleepID = 0 }
         if displaySleepID != 0 { IOPMAssertionRelease(displaySleepID); displaySleepID = 0 }
+    }
+
+    private func isClamshellSleepDisabled() -> Bool {
+        let root = IOPMFindPowerManagement(mach_port_t(MACH_PORT_NULL))
+        guard root != 0 else { return false }
+        defer { IOObjectRelease(root) }
+        guard let raw = IORegistryEntryCreateCFProperty(
+            root,
+            "SleepDisabled" as CFString,
+            kCFAllocatorDefault,
+            0
+        )?.takeRetainedValue() else {
+            return false
+        }
+        if let b = raw as? Bool { return b }
+        if let n = raw as? NSNumber { return n.boolValue }
+        return false
+    }
+
+    @discardableResult
+    private func setClamshellSleepDisabled(_ disable: Bool) -> Bool {
+        let flag = disable ? 1 : 0
+        let cmd = "do shell script \"/usr/bin/pmset -a disablesleep \(flag)\" with administrator privileges"
+        var errorInfo: NSDictionary?
+        NSAppleScript(source: cmd)?.executeAndReturnError(&errorInfo)
+        if let err = errorInfo {
+            let code = err[NSAppleScript.errorNumber] as? Int ?? 0
+            if code != -128 {
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "切换合盖防休眠状态失败"
+                alert.informativeText = (err[NSAppleScript.errorMessage] as? String) ?? "无法执行 pmset 命令"
+                alert.runModal()
+            }
+            return false
+        }
+        return true
     }
 
     private func applyState() {
@@ -218,6 +258,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         displayItem.tag = MenuTag.display.rawValue
         menu.addItem(displayItem)
 
+        let clamshellItem = NSMenuItem(title: "阻止合盖休眠（需管理员授权）", action: #selector(toggleClamshell), keyEquivalent: "")
+        clamshellItem.target = self
+        clamshellItem.tag = MenuTag.clamshell.rawValue
+        menu.addItem(clamshellItem)
+
         menu.addItem(.separator())
 
         let loginItem = NSMenuItem(title: "开机自动启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
@@ -227,7 +272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        let quit = NSMenuItem(title: "退出 PulseAwake", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "退出 PulseAwake", action: #selector(handleQuit), keyEquivalent: "q")
+        quit.target = self
         menu.addItem(quit)
 
         statusItem.menu = menu
@@ -245,6 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let jiggleOn = defaults.bool(forKey: kJiggleEnabled)
         let sleepOn = defaults.bool(forKey: kPreventSleep)
         let displayOn = defaults.bool(forKey: kPreventDisplay)
+        let clamshellOn = isClamshellSleepDisabled()
         let interval = defaults.integer(forKey: kJiggleInterval)
         let trusted = AXIsProcessTrusted()
 
@@ -253,11 +300,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 status.title = "⚠️ 缺少辅助功能权限（保活未生效）"
             } else if jiggleOn {
                 let idle = Int(currentIdleSeconds())
-                var text = "运行中 · 空闲 \(idle)s/\(interval)s · 触发 \(jiggleCount) 次"
+                let prefix = clamshellOn ? "🔒 合盖常亮" : "运行中"
+                var text = "\(prefix) · 空闲 \(idle)s/\(interval)s · 触发 \(jiggleCount) 次"
                 if let d = lastJiggle {
                     text += " · 最近 \(timeFormatter.string(from: d))"
                 }
                 status.title = text
+            } else if clamshellOn {
+                status.title = "🔒 合盖不休眠已开启（装包前请关闭）"
             } else if sleepOn || displayOn {
                 status.title = "仅防休眠运行中"
             } else {
@@ -269,6 +319,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.item(withTag: MenuTag.jiggle.rawValue)?.state = jiggleOn ? .on : .off
         menu.item(withTag: MenuTag.sleep.rawValue)?.state = sleepOn ? .on : .off
         menu.item(withTag: MenuTag.display.rawValue)?.state = displayOn ? .on : .off
+        menu.item(withTag: MenuTag.clamshell.rawValue)?.state = clamshellOn ? .on : .off
         menu.item(withTag: MenuTag.launchLogin.rawValue)?.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
 
         if let intervalSubmenu = menu.items.first(where: { $0.submenu != nil })?.submenu {
@@ -280,7 +331,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateIcon() {
         let jiggleOn = defaults.bool(forKey: kJiggleEnabled)
-        let anySleepGuard = defaults.bool(forKey: kPreventSleep) || defaults.bool(forKey: kPreventDisplay)
+        let anySleepGuard = defaults.bool(forKey: kPreventSleep) ||
+                            defaults.bool(forKey: kPreventDisplay) ||
+                            isClamshellSleepDisabled()
         let trusted = AXIsProcessTrusted()
 
         let symbolName: String
@@ -336,6 +389,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshMenuState()
     }
 
+    @objc private func toggleClamshell() {
+        let currentlyDisabled = isClamshellSleepDisabled()
+        _ = setClamshellSleepDisabled(!currentlyDisabled)
+        updateIcon()
+        refreshMenuState()
+    }
+
     @objc private func toggleLaunchAtLogin() {
         let service = SMAppService.mainApp
         do {
@@ -351,6 +411,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             alert.runModal()
         }
         refreshMenuState()
+    }
+
+    @objc private func handleQuit() {
+        if isClamshellSleepDisabled() {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "“阻止合盖休眠”仍处于开启状态"
+            alert.informativeText = "退出前建议恢复正常合盖休眠，避免笔记本放入包中持续运行导致发热与耗电。"
+            alert.addButton(withTitle: "恢复正常休眠并退出")
+            alert.addButton(withTitle: "保持开启并退出")
+            alert.addButton(withTitle: "取消")
+
+            let resp = alert.runModal()
+            if resp == .alertFirstButtonReturn {
+                if !setClamshellSleepDisabled(false) {
+                    return
+                }
+            } else if resp == .alertThirdButtonReturn {
+                return
+            }
+        }
+        NSApp.terminate(nil)
     }
 }
 
