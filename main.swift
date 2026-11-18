@@ -1,6 +1,8 @@
 import Cocoa
 import IOKit.pwr_mgt
 import CoreGraphics
+import ApplicationServices
+import ServiceManagement
 
 private let kJiggleEnabled  = "jiggleEnabled"
 private let kJiggleInterval = "jiggleInterval"
@@ -9,10 +11,12 @@ private let kPreventDisplay = "preventDisplaySleep"
 private let kAssertionName  = "PulseAwake" as CFString
 
 private enum MenuTag: Int {
-    case status  = 100
-    case jiggle  = 102
-    case sleep   = 103
-    case display = 104
+    case status      = 100
+    case permission  = 101
+    case jiggle      = 102
+    case sleep       = 103
+    case display     = 104
+    case launchLogin = 105
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -22,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var displaySleepID: IOPMAssertionID = 0
     private var jiggleCount = 0
     private var lastJiggle: Date?
+    private var lastTrusted = false
     private let defaults = UserDefaults.standard
 
     private lazy var timeFormatter: DateFormatter = {
@@ -37,6 +42,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             kPreventSleep: true,
             kPreventDisplay: true
         ])
+
+        lastTrusted = AXIsProcessTrusted()
+        if defaults.bool(forKey: kJiggleEnabled) && !lastTrusted {
+            promptAccessibility(openSettings: false)
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         buildMenu()
@@ -66,7 +76,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func tick() {
-        guard defaults.bool(forKey: kJiggleEnabled) else { return }
+        let trusted = AXIsProcessTrusted()
+        if trusted != lastTrusted {
+            lastTrusted = trusted
+            updateIcon()
+        }
+
+        guard defaults.bool(forKey: kJiggleEnabled), trusted else { return }
+
         let threshold = Double(max(15, defaults.integer(forKey: kJiggleInterval)))
         let idle = currentIdleSeconds()
         if idle >= threshold && !isMouseButtonDown() {
@@ -85,6 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func performJiggle() {
+        guard AXIsProcessTrusted() else { return }
         let src = CGEventSource(stateID: .hidSystemState)
         let cur = CGEvent(source: nil)?.location ?? CGPoint(x: 500, y: 500)
         let dx: CGFloat = cur.x > 10 ? -1 : 1
@@ -102,6 +120,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 CGEvent(mouseEventSource: src, mouseType: .mouseMoved,
                         mouseCursorPosition: cur, mouseButton: .left)?.post(tap: .cghidEventTap)
             }
+        }
+    }
+
+    private func promptAccessibility(openSettings: Bool) {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        if openSettings, let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -157,6 +183,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status.isEnabled = false
         menu.addItem(status)
 
+        let permItem = NSMenuItem(title: "授权辅助功能权限…", action: #selector(requestAccessibility), keyEquivalent: "")
+        permItem.target = self
+        permItem.tag = MenuTag.permission.rawValue
+        menu.addItem(permItem)
+
         menu.addItem(.separator())
 
         let jiggleItem = NSMenuItem(title: "空闲保活（防自动离开）", action: #selector(toggleJiggle), keyEquivalent: "")
@@ -189,6 +220,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        let loginItem = NSMenuItem(title: "开机自动启动", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.tag = MenuTag.launchLogin.rawValue
+        menu.addItem(loginItem)
+
+        menu.addItem(.separator())
+
         let quit = NSMenuItem(title: "退出 PulseAwake", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
 
@@ -197,6 +235,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        lastTrusted = AXIsProcessTrusted()
+        updateIcon()
         refreshMenuState()
     }
 
@@ -206,9 +246,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let sleepOn = defaults.bool(forKey: kPreventSleep)
         let displayOn = defaults.bool(forKey: kPreventDisplay)
         let interval = defaults.integer(forKey: kJiggleInterval)
+        let trusted = AXIsProcessTrusted()
 
         if let status = menu.item(withTag: MenuTag.status.rawValue) {
-            if jiggleOn {
+            if jiggleOn && !trusted {
+                status.title = "⚠️ 缺少辅助功能权限（保活未生效）"
+            } else if jiggleOn {
                 let idle = Int(currentIdleSeconds())
                 var text = "运行中 · 空闲 \(idle)s/\(interval)s · 触发 \(jiggleCount) 次"
                 if let d = lastJiggle {
@@ -222,9 +265,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        menu.item(withTag: MenuTag.permission.rawValue)?.isHidden = trusted
         menu.item(withTag: MenuTag.jiggle.rawValue)?.state = jiggleOn ? .on : .off
         menu.item(withTag: MenuTag.sleep.rawValue)?.state = sleepOn ? .on : .off
         menu.item(withTag: MenuTag.display.rawValue)?.state = displayOn ? .on : .off
+        menu.item(withTag: MenuTag.launchLogin.rawValue)?.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
 
         if let intervalSubmenu = menu.items.first(where: { $0.submenu != nil })?.submenu {
             for item in intervalSubmenu.items {
@@ -234,20 +279,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateIcon() {
-        let active = defaults.bool(forKey: kJiggleEnabled) ||
-                     defaults.bool(forKey: kPreventSleep) ||
-                     defaults.bool(forKey: kPreventDisplay)
-        let symbolName = active ? "bolt.horizontal.circle.fill" : "bolt.horizontal.circle"
+        let jiggleOn = defaults.bool(forKey: kJiggleEnabled)
+        let anySleepGuard = defaults.bool(forKey: kPreventSleep) || defaults.bool(forKey: kPreventDisplay)
+        let trusted = AXIsProcessTrusted()
+
+        let symbolName: String
+        if jiggleOn && !trusted {
+            symbolName = "exclamationmark.triangle"
+        } else if jiggleOn || anySleepGuard {
+            symbolName = "bolt.horizontal.circle.fill"
+        } else {
+            symbolName = "bolt.horizontal.circle"
+        }
+
         if let img = NSImage(systemSymbolName: symbolName, accessibilityDescription: "PulseAwake") {
             img.isTemplate = true
             statusItem.button?.image = img
+            statusItem.button?.title = ""
         } else {
-            statusItem.button?.title = active ? "保活" : "暂停"
+            statusItem.button?.image = nil
+            statusItem.button?.title = (jiggleOn || anySleepGuard) ? "保活" : "暂停"
         }
     }
 
+    // MARK: - 菜单交互动作
+
+    @objc private func requestAccessibility() {
+        promptAccessibility(openSettings: true)
+    }
+
     @objc private func toggleJiggle() {
-        defaults.set(!defaults.bool(forKey: kJiggleEnabled), forKey: kJiggleEnabled)
+        let next = !defaults.bool(forKey: kJiggleEnabled)
+        defaults.set(next, forKey: kJiggleEnabled)
+        if next && !AXIsProcessTrusted() {
+            promptAccessibility(openSettings: false)
+        }
         applyState()
         refreshMenuState()
     }
@@ -268,6 +334,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         defaults.set(!defaults.bool(forKey: kPreventDisplay), forKey: kPreventDisplay)
         applyState()
         refreshMenuState()
+    }
+
+    @objc private func toggleLaunchAtLogin() {
+        let service = SMAppService.mainApp
+        do {
+            if service.status == .enabled {
+                try service.unregister()
+            } else {
+                try service.register()
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "设置开机自动启动失败"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+        }
+        refreshMenuState()
+    }
+}
+
+if CommandLine.arguments.contains("--enable-login") {
+    do {
+        if SMAppService.mainApp.status != .enabled {
+            try SMAppService.mainApp.register()
+        }
+        print("LaunchAtLogin status=\(SMAppService.mainApp.status.rawValue)")
+        exit(0)
+    } catch {
+        fputs("Failed to enable LaunchAtLogin: \(error.localizedDescription)\n", stderr)
+        exit(1)
     }
 }
 
