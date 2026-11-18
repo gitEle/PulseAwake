@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# Build & distribution artifacts
+dist/
+build/
+*.app
+*.icns
+*.zip
+SHA256SUMS.txt
+
+# Swift / Xcode caches
+.build/
+.swiftpm/
+.swiftcache/
+*.dSYM
